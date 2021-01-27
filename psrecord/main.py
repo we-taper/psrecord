@@ -26,22 +26,32 @@
 from __future__ import (unicode_literals, division, print_function,
                         absolute_import)
 
-import time
 import argparse
+import time
+
+import psutil
 
 children = []
 
+N_BYTES_PER_MB = 1024. ** 2
+
 
 def get_percent(process):
-    return process.cpu_percent()
+    try:
+        return process.cpu_percent()
+    except AttributeError:
+        return psutil.cpu_percent()
 
 
 def get_memory(process):
-    return process.memory_info()
+    try:
+        ret = process.memory_info()
+        return ret.rss / N_BYTES_PER_MB, ret.vms / 1024. ** 2
+    except AttributeError:
+        return psutil.virtual_memory().used / N_BYTES_PER_MB, psutil.swap_memory().used / N_BYTES_PER_MB
 
 
 def all_children(pr):
-
     global children
 
     try:
@@ -57,12 +67,11 @@ def all_children(pr):
 
 
 def main():
-
     parser = argparse.ArgumentParser(
         description='Record CPU and memory usage for a process')
 
     parser.add_argument('process_id_or_command', type=str,
-                        help='the process id or command')
+                        help='the process id or command. If id is -1, then the usage of all processes are recorded.')
 
     parser.add_argument('--log', type=str,
                         help='output the statistics to a file')
@@ -76,9 +85,9 @@ def main():
                              'the job exits.')
 
     parser.add_argument('--interval', type=float,
-                        help='how long to wait between each sample (in '
-                             'seconds). By default the process is sampled '
-                             'as often as possible.')
+                        help='how long to wait between each sample (in seconds). '
+                             'Experience shows that interval >= 1 is good. (Default=1)',
+                        default=1)
 
     parser.add_argument('--include-children',
                         help='include sub-processes in statistics (results '
@@ -90,15 +99,17 @@ def main():
     # Attach to process
     try:
         pid = int(args.process_id_or_command)
-        print("Attaching to process {0}".format(pid))
-        sprocess = None
-    except Exception:
+    except (ValueError, TypeError):
+        # pid is a command
         import subprocess
         command = args.process_id_or_command
         print("Starting up command '{0}' and attaching to process"
               .format(command))
         sprocess = subprocess.Popen(command, shell=True)
         pid = sprocess.pid
+    else:
+        # pid is an integer
+        sprocess = None
 
     monitor(pid, logfile=args.log, plot=args.plot, duration=args.duration,
             interval=args.interval, include_children=args.include_children)
@@ -107,32 +118,36 @@ def main():
         sprocess.kill()
 
 
-def monitor(pid, logfile=None, plot=None, duration=None, interval=None,
-            include_children=False):
-
+def monitor(
+        pid, logfile=None, plot=None, duration=None, interval=None,
+        include_children=False):
     # We import psutil here so that the module can be imported even if psutil
     # is not present (for example if accessing the version)
-    import psutil
 
-    pr = psutil.Process(pid)
+    if pid == -1:
+        # Since process IDs are probably positive
+        # Ref: https://stackoverflow.com/questions/9584231/are-process-ids-non-negative-in-linux
+        # -1 is a flag we use for all processes
+        pr = None
+        import warnings
+        warnings.warn("Since pid=-1, virtual memory actually reports swapped memory.")
+    else:
+        pr = psutil.Process(pid)
+        print("Attached to the process (PID={0})".format(pid))
 
     # Record start time
     start_time = time.time()
 
     if logfile:
         f = open(logfile, 'w')
-        f.write("# {0:12s} {1:12s} {2:12s} {3:12s}\n".format(
+        f.write("# {0:12s}, {1:12s}, {2:12s}, {3:12s}\n".format(
             'Elapsed time'.center(12),
             'CPU (%)'.center(12),
             'Real (MB)'.center(12),
             'Virtual (MB)'.center(12))
         )
 
-    log = {}
-    log['times'] = []
-    log['cpu'] = []
-    log['mem_real'] = []
-    log['mem_virtual'] = []
+    log = {'times': [], 'cpu': [], 'mem_real': [], 'mem_virtual': []}
 
     try:
 
@@ -142,18 +157,20 @@ def monitor(pid, logfile=None, plot=None, duration=None, interval=None,
             # Find current time
             current_time = time.time()
 
-            try:
-                pr_status = pr.status()
-            except TypeError:  # psutil < 2.0
-                pr_status = pr.status
-            except psutil.NoSuchProcess:  # pragma: no cover
-                break
+            if pr is not None:
+                # check process' status
+                try:
+                    pr_status = pr.status()
+                except TypeError:  # psutil < 2.0
+                    pr_status = pr.status
+                except psutil.NoSuchProcess:  # pragma: no cover
+                    break
 
-            # Check if process status indicates we should exit
-            if pr_status in [psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD]:
-                print("Process finished ({0:.2f} seconds)"
-                      .format(current_time - start_time))
-                break
+                # Check if process status indicates we should exit
+                if pr_status in [psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD]:
+                    print("Process finished ({0:.2f} seconds)"
+                          .format(current_time - start_time))
+                    break
 
             # Check if we have reached the maximum time
             if duration is not None and current_time - start_time > duration:
@@ -162,25 +179,24 @@ def monitor(pid, logfile=None, plot=None, duration=None, interval=None,
             # Get current CPU and memory
             try:
                 current_cpu = get_percent(pr)
-                current_mem = get_memory(pr)
+                current_mem_real, current_mem_virtual = get_memory(pr)
             except Exception:
                 break
-            current_mem_real = current_mem.rss / 1024. ** 2
-            current_mem_virtual = current_mem.vms / 1024. ** 2
 
             # Get information for children
             if include_children:
+                import warnings
+                warnings.warn("include_children has not been tested.", UserWarning)  # TODO(hx): test it.
                 for child in all_children(pr):
                     try:
                         current_cpu += get_percent(child)
-                        current_mem = get_memory(child)
+                        current_mem_real, current_mem_virtual = get_memory(
+                            child)  # TODO(hx): why not do something like += above?
                     except Exception:
                         continue
-                    current_mem_real += current_mem.rss / 1024. ** 2
-                    current_mem_virtual += current_mem.vms / 1024. ** 2
 
             if logfile:
-                f.write("{0:12.3f} {1:12.3f} {2:12.3f} {3:12.3f}\n".format(
+                f.write("{0:12.3f},{1:12.3f},{2:12.3f},{3:12.3f}\n".format(
                     current_time - start_time,
                     current_cpu,
                     current_mem_real,
@@ -204,11 +220,9 @@ def monitor(pid, logfile=None, plot=None, duration=None, interval=None,
         f.close()
 
     if plot:
-
         # Use non-interactive backend, to enable operation on headless machines
         import matplotlib.pyplot as plt
         with plt.rc_context({'backend': 'Agg'}):
-
             fig = plt.figure()
             ax = fig.add_subplot(1, 1, 1)
 
